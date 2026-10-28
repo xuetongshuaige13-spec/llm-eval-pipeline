@@ -1,13 +1,21 @@
+import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 from typing import List, Dict, Any
+
+# 统一工程根目录寻址
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
-from openai import OpenAI
+from openai import AsyncOpenAI
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # 加载 .env 环境变量
 load_dotenv()
+
 
 # ================================
 # 1. 评测输出 Schema 定义
@@ -63,31 +71,41 @@ JUDGE_USER_TEMPLATE = """[用户问题]: {query}
 
 
 # ================================
-# 3. 评测流水线核心类
+# 3. 异步高并发评测流水线
 # ================================
-class LLMEvalPipeline:
-    def __init__(self, input_file: str, output_file: str):
+class AsyncLLMEvalPipeline:
+    def __init__(self, input_file: str, output_file: str, max_concurrency: int = 5):
         self.input_file = input_file
         self.output_file = output_file
+        self.max_concurrency = max_concurrency
+        self.semaphore = asyncio.Semaphore(max_concurrency)
         self.mock_mode = os.getenv("MOCK_MODE", "false").lower() == "true"
 
         if not self.mock_mode:
             api_key = os.getenv("OPENAI_API_KEY")
             base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
             if not api_key or api_key == "your_api_key_here":
-                raise ValueError("未检测到有效 OPENAI_API_KEY。若要进行本地模拟调试，请在 .env 中设置 MOCK_MODE=true")
-            self.client = OpenAI(api_key=api_key, base_url=base_url)
-            self.model_name = os.getenv("MODEL_NAME", "gpt-3.5-turbo")
+                raise ValueError("未检测到有效 OPENAI_API_KEY。若要模拟调试，请在 .env 中设置 MOCK_MODE=true")
+            # 切换为异步客户端 AsyncOpenAI
+            self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+            self.model_name = os.getenv("MODEL_NAME", "deepseek-chat")
 
-    def _call_judge_llm(self, query: str, ground_truth: str, predicted_resp: str) -> JudgeResult:
-        """调用大模型裁判或本地 Mock 评测"""
+    # 配置指数退避重试：遇到网络抖动或解析异常最多重试 3 次，等待时间以 2^x 秒递增
+    @retry(
+        reraise=True,
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((Exception,))
+    )
+    async def _call_judge_llm_with_retry(self, query: str, ground_truth: str, predicted_resp: str) -> JudgeResult:
+        """带自动重试的大模型异步评测调用"""
         if self.mock_mode:
-            # 本地 Mock 数据，保证无 Key 状态下全管线通畅跑通
+            await asyncio.sleep(0.1)  # 模拟异步 I/O 网络延时
             return JudgeResult(
                 relevance_score=5,
-                relevance_rationale="[Mock] 候选回答准确命中了用户提问的核心实体与意图。",
-                faithfulness_score=4,
-                faithfulness_rationale="[Mock] 回答与标准答案基本吻合，未检测到明显事实幻觉。",
+                relevance_rationale="[Mock] 候选回答准确命中了用户提问意图。",
+                faithfulness_score=5,
+                faithfulness_rationale="[Mock] 回答与参考答案一致。",
                 overall_pass=True
             )
 
@@ -97,7 +115,7 @@ class LLMEvalPipeline:
             predicted_response=predicted_resp
         )
 
-        response = self.client.chat.completions.create(
+        response = await self.client.chat.completions.create(
             model=self.model_name,
             messages=[
                 {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
@@ -106,62 +124,75 @@ class LLMEvalPipeline:
             temperature=0.0,
             response_format={"type": "json_object"}
         )
+
         raw_content = response.choices[0].message.content
         if not raw_content:
-            raise ValueError(f"裁判大模型返回内容为空或被拦截: {response}")
+            raise ValueError(f"裁判大模型返回为空: {response}")
 
         return JudgeResult.model_validate_json(raw_content)
 
-    def run(self):
-        """执行批量评测"""
+    async def _evaluate_single_item(self, data: Dict[str, Any], idx: int) -> EvalRecord | None:
+        """单条评测任务：受信号量保护的协程任务"""
+        async with self.semaphore:
+            query = data["query"]
+            ground_truth = data["response"]
+            candidate = f"{ground_truth}（经由测试模型生成）"
+            item_id = str(data.get("id", idx))
+
+            print(f"[*] [任务并发中] 样本 [{item_id}]: {query[:20]}...")
+            try:
+                judge_result = await self._call_judge_llm_with_retry(query, ground_truth, candidate)
+                return EvalRecord(
+                    id=item_id,
+                    query=query,
+                    ground_truth=ground_truth,
+                    predicted_response=candidate,
+                    judge=judge_result
+                )
+            except Exception as e:
+                print(f"[!] [任务失败/重试耗尽] 样本 [{item_id}]: {str(e)}")
+                return None
+
+    async def run(self):
+        """执行端到端异步批量评测"""
         if not os.path.exists(self.input_file):
             raise FileNotFoundError(f"未找到输入数据文件: {self.input_file}")
 
         os.makedirs(os.path.dirname(self.output_file), exist_ok=True)
-        eval_records: List[EvalRecord] = []
 
-        print(f"[*] 启动评测流程 (Mock Mode: {self.mock_mode})")
-        print(f"[*] 读取清洗后数据: {self.input_file}")
+        raw_items: List[Dict[str, Any]] = []
+        with open(self.input_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    raw_items.append(json.loads(line.strip()))
 
-        with open(self.input_file, "r", encoding="utf-8") as fin:
-            for idx, line in enumerate(fin, start=1):
-                clean_line = line.strip()
-                if not clean_line:
-                    continue
+        total_count = len(raw_items)
+        print(f"\n=======================================================")
+        print(f"[*] 启动异步评测引擎 (并发上限: {self.max_concurrency} | 总任务数: {total_count})")
+        print(f"=======================================================\n")
 
-                data = json.loads(clean_line)
-                query = data["query"]
-                ground_truth = data["response"]
+        # 创建所有协程任务并使用 asyncio.gather 并发调度
+        tasks = [
+            self._evaluate_single_item(item, idx)
+            for idx, item in enumerate(raw_items, start=1)
+        ]
+        results = await asyncio.gather(*tasks)
 
-                # 构造候选回答（实际项目中来自待测试模型输出；此处模拟生成略有变动的测试回答）
-                candidate_response = f"{ground_truth}（本回答由测试模型生成）"
+        # 过滤执行失败的脏数据并收集有效记录
+        valid_records: List[EvalRecord] = [r for r in results if r is not None]
 
-                print(f"    -> 正在评测样本 [{data.get('id', idx)}]: {query[:25]}...")
-                try:
-                    judge_result = self._call_judge_llm(query, ground_truth, candidate_response)
-                    record = EvalRecord(
-                        id=data.get("id", str(idx)),
-                        query=query,
-                        ground_truth=ground_truth,
-                        predicted_response=candidate_response,
-                        judge=judge_result
-                    )
-                    eval_records.append(record)
-                except (ValidationError, Exception) as e:
-                    print(f"    [!] 评测出错: {str(e)}")
-
-        # 保存评测结果
+        # 写入结果明细文件
         with open(self.output_file, "w", encoding="utf-8") as fout:
-            for item in eval_records:
+            for item in valid_records:
                 fout.write(item.model_dump_json() + "\n")
 
-        self._print_eval_report(eval_records)
+        self._print_eval_report(valid_records)
 
     def _print_eval_report(self, records: List[EvalRecord]):
-        """生成并输出评测统计指标看板"""
+        """生成评测审计看板"""
         total = len(records)
         if total == 0:
-            print("[!] 未产出有效评测数据。")
+            print("[!] 本次评测未产出有效数据。")
             return
 
         avg_rel = sum(r.judge.relevance_score for r in records) / total
@@ -170,19 +201,22 @@ class LLMEvalPipeline:
         pass_rate = (pass_count / total) * 100
 
         print("\n" + "="*45)
-        print("           自动化评测审计看板 (Eval Dashboard)")
+        print("        异步自动化评测看板 (Async Eval Dashboard)")
         print("="*45)
-        print(f"评测样本总数 (Total Evaluated):       {total}")
+        print(f"评测总样本数 (Total Evaluated):       {total}")
         print(f"平均关联度分 (Avg Relevance):         {avg_rel:.2f} / 5.0")
         print(f"平均忠实度分 (Avg Faithfulness):      {avg_faith:.2f} / 5.0")
         print(f"综合合格率 (Overall Pass Rate):       {pass_rate:.2f}%")
         print("="*45)
-        print(f"[+] 评测明细文件已保存至: {self.output_file}\n")
+        print(f"[+] 异步评测明细已保存至: {self.output_file}\n")
 
 
 if __name__ == "__main__":
     INPUT_FILE = os.path.join("data", "processed", "clean_qa.jsonl")
     OUTPUT_FILE = os.path.join("data", "processed", "eval_results.jsonl")
 
-    pipeline = LLMEvalPipeline(input_file=INPUT_FILE, output_file=OUTPUT_FILE)
-    pipeline.run()
+    # 实例化并设置最大并发度为 5
+    pipeline = AsyncLLMEvalPipeline(input_file=INPUT_FILE, output_file=OUTPUT_FILE, max_concurrency=5)
+
+    # 启动异步事件循环
+    asyncio.run(pipeline.run())
