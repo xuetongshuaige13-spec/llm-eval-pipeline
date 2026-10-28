@@ -1,6 +1,10 @@
 # 基于 Python 的生成式 AI 问答数据清洗与自动化评测管线 (LLM Data Clean & Eval Pipeline)
+[![CI Pipeline](https://github.com/xuetongshuaige13-spec/llm-eval-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/xuetongshuaige13-spec/llm-eval-pipeline/actions/workflows/ci.yml)
+面向企业级大模型问答系统的轻量化工程管线。涵盖从原始弱格式/脏数据的声明式模式清洗，到基于 **LLM-as-a-Judge** 的多维度自动化评估，支持 **RAG 三元组** 评估、原子级幻觉定位与高并发异步执行，并提供交互式 Web 审计看板。
 
-面向企业级大模型问答系统的轻量化工程管线。涵盖从原始弱格式/脏数据的声明式模式清洗，到基于 **LLM-as-a-Judge** 的多维度自动化评估，并集成了对抗样本区分度测试机制。
+<p align="center">
+  <img src="assets/dashboard_preview.png" alt="RAG Eval Dashboard Preview" width="100%">
+</p>
 
 ---
 
@@ -16,31 +20,35 @@
          └──> [标准 QA 数据集 (clean_qa.jsonl)]
                      │
                      ▼
-         [LLMEvalPipeline] ─── (OpenAI 兼容协议 + JSON Mode 强结构输出)
+         [AsyncLLMEvalPipeline / RAGTriadPipeline] ─── (AsyncOpenAI + 并发信号量 + tenacity 重试)
                      │
-                     ├──> 维度 1: 关联度 (Relevance, 1-5)
-                     ├──> 维度 2: 忠实度 (Faithfulness, 1-5)
-                     └──> 幻觉检测 (Hallucination Detection)
+                     ├──> 维度 1: 检索相关度 (Context Relevance, 1-5)
+                     ├──> 维度 2: 回答忠实度 (Faithfulness, 1-5) ──> [原子级幻觉定位]
+                     └──> 维度 3: 回答相关度 (Answer Relevance, 1-5)
                      │
                      ▼
-         [评测审计看板 (Eval Dashboard) & 结果明细 (eval_results.jsonl)]
+         [Streamlit 交互审计看板 (app.py) & 评测结果明细 (JSONL)]
 ```
 
 ---
 
 ## 核心技术特性
 
-1. **声明式数据清洗 (Declarative Data Sanitization)**：
-   - 基于 **Pydantic V2** 构建标准 QA Schema 约束。
-   - 提供流式容错处理机制，优雅隔离 JSONDecodeError、非法字段类型与空白字符串。
-   - 包含端到端清洗审计追踪，量化计算数据清洗合格率（Pass Rate）。
-2. **LLM-as-a-Judge 自动化评测打分**：
-   - 将评测准则（Rubric）工程化，解耦为 **关联度 (Relevance)** 与 **忠实度 (Faithfulness)** 两个正交维度。
-   - 利用 LLM 的 `response_format={"type": "json_object"}` 强制输出结构化评分与打分推理（Rationale）。
-   - 具备本地 Mock 降级机制，支持无 Key 状态下的全链路逻辑调试。
-3. **裁判鉴别力对抗压测 (Adversarial Stress Test)**：
-   - 内置高质量回答、严重事实幻觉、答非所问三类对照实验样本。
-   - 验证评测体系对虚构信息与语义漂移的敏感度，规避模型“老好人”打分偏好。
+1. **声明式数据清洗 (Declarative Sanitization)**：
+   - 基于 **Pydantic V2** 构建标准数据模型约束。
+   - 提供流式容错解析，自动隔离 `JSONDecodeError`、非法字段类型与空白异常数据。
+   - 端到端审计追踪，量化计算清洗合格率（Pass Rate）。
+2. **高并发异步评测引擎 (Async Evaluation Engine)**：
+   - 基于 `asyncio` 与 `AsyncOpenAI` 搭建非阻塞评测执行流水线。
+   - 使用 `asyncio.Semaphore` 实施精细化并发控制，杜绝瞬时流量触发 API 限流（429）。
+   - 接入 `tenacity` 库实现带随机抖动的指数退避重试（Exponential Backoff with Jitter）。
+3. **RAG 三元组与细粒度幻觉排查 (RAG Triad & Hallucination)**：
+   - **Context Relevance**：评估检索召回切片的支撑有效性与噪声比例。
+   - **Faithfulness / Groundedness**：基于原子断言（Atomic Claims）拆解，检测大模型先验知识污染，并定位幻觉句子。
+   - **Answer Relevance**：评估模型回答与用户真实意图的契合程度。
+4. **Streamlit 交互式审计看板**：
+   - 提供开箱即用的 Web 评测工作台，集成综合合格率、维度均值分布及 KPI 指标卡。
+   - 支持样本下钻筛选，高亮展示被系统捕获的幻觉断言及裁判推理（Rationale）。
 
 ---
 
@@ -48,13 +56,17 @@
 
 ```text
 llm-eval-pipeline/
+├── assets/
+│   └── dashboard_preview.png # 看板效果预览截图
 ├── data/
-│   ├── raw/                 # 原始脏数据
+│   ├── raw/                 # 原始脏数据与 RAG 评测输入
 │   └── processed/           # 清洗入库及评测打分结果
 ├── src/
 │   ├── __init__.py          # 模块标识
+│   ├── app.py               # Streamlit 可视化审计看板
 │   ├── clean_pipeline.py    # 数据清洗与校验流水线
-│   ├── eval_pipeline.py     # LLM 自动化评测流水线
+│   ├── eval_pipeline.py     # 异步并发评测流水线
+│   ├── rag_eval_pipeline.py # RAG 三元组与幻觉评测流水线
 │   └── test_adversarial.py  # 裁判区分度对抗压测脚本
 ├── .env.example             # 环境变量配置模板
 ├── .gitignore               # Git 忽略规则
@@ -67,7 +79,7 @@ llm-eval-pipeline/
 
 ### 1. 虚拟环境配置
 ```bash
-git clone [https://github.com/xuetongshuaige13-spec/llm-eval-pipeline.git](https://github.com/xuetongshuaige13-spec/llm-eval-pipeline.git)
+git clone https://github.com/xuetongshuaige13-spec/llm-eval-pipeline.git
 cd llm-eval-pipeline
 python -m venv venv
 
@@ -86,32 +98,37 @@ copy .env.example .env
 修改 `.env` 核心配置：
 ```ini
 OPENAI_API_KEY=your_actual_api_key
-OPENAI_BASE_URL=[https://api.deepseek.com/v1](https://api.deepseek.com/v1)
+OPENAI_BASE_URL=https://api.deepseek.com/v1
 MODEL_NAME=deepseek-chat
 MOCK_MODE=false
 ```
 
-### 3. 执行数据清洗管线
+### 3. 执行核心流水线
 ```bash
+# 运行数据清洗管线
 python src/clean_pipeline.py
-```
 
-### 4. 运行自动化评测
-```bash
+# 运行异步自动化评测
 python src/eval_pipeline.py
+
+# 运行 RAG 三元组与幻觉评测
+python src/rag_eval_pipeline.py
+
+# 运行对抗样本区分度测试
+python src/test_adversarial.py
 ```
 
-### 5. 运行对抗样本区分度测试
+### 4. 启动 Web 可视化交互看板
 ```bash
-python src/test_adversarial.py
+streamlit run src/app.py
 ```
 
 ---
 
-## 评测压测实测指标
+## RAG 评测压测实测指标
 
-| 候选回答类型 | 关联度 (Relevance) | 忠实度 (Faithfulness) | 综合判定 (Overall Pass) |
-| :--- | :---: | :---: | :---: |
-| 高质量基准回答 | 5 / 5 | 5 / 5 | **Pass** |
-| 严重事实幻觉样本 | 2 / 5 | 1 / 5 | **Failed** |
-| 答非所问/脱靶样本 | 1 / 5 | 1 / 5 | **Failed** |
+| 样本类型 | 检索相关度 (Context) | 回答忠实度 (Faithfulness) | 回答相关度 (Answer) | 幻觉检测定位 | 综合判定 |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| 黄金基准样本 (`rag_001`) | 5.0 / 5 | 5.0 / 5 | 5.0 / 5 | 无幻觉 | **Pass** |
+| 检索噪声/上下文缺失 (`rag_002`) | 2.0 / 5 | 2.0 / 5 | 4.0 / 5 | 上下文未支撑断言 | **Failed** |
+| 事实严重冲突/强幻觉 (`rag_003`) | 4.0 / 5 | 1.0 / 5 | 3.0 / 5 | 精准提取虚构断言 | **Failed** |
