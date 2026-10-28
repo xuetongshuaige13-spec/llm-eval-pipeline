@@ -1,6 +1,11 @@
 # 基于 Python 的生成式 AI 问答数据清洗与自动化评测管线 (LLM Data Clean & Eval Pipeline)
-[![CI Pipeline](https://github.com/xuetongshuaige13-spec/llm-eval-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/xuetongshuaige13-spec/llm-eval-pipeline/actions/workflows/ci.yml)
-面向企业级大模型问答系统的轻量化工程管线。涵盖从原始弱格式/脏数据的声明式模式清洗，到基于 **LLM-as-a-Judge** 的多维度自动化评估，支持 **RAG 三元组** 评估、原子级幻觉定位与高并发异步执行，并提供交互式 Web 审计看板。
+
+[![CI Pipeline](https://github.com/xuetongshuaige13-spec/llm-eval-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/xuetongshuaige13-spec/llm-eval-pipeline/actions)
+![Python Version](https://img.shields.io/badge/python-3.10%2B-blue)
+![Pydantic](https://img.shields.io/badge/data%20validation-Pydantic%20V2-red)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+面向企业级大模型问答系统与智能体应用的轻量化工程管线。涵盖从原始弱格式/脏数据的声明式模式清洗，到基于 **LLM-as-a-Judge 的 RAG 三元组细粒度幻觉排查**与 **Agent 工具调用决策审计**，支持异步高并发流量削峰，并提供交互式 Web 审计看板与全自动 CI/CD 验证。
 
 <p align="center">
   <img src="assets/dashboard_preview.png" alt="RAG Eval Dashboard Preview" width="100%">
@@ -8,127 +13,84 @@
 
 ---
 
-## 核心架构设计
+## 🌟 核心特性
 
-```text
-[原始脏数据 (JSONL)]
-         │
-         ▼
-[DataCleanPipeline] ─── (流式解析 + Pydantic V2 强模式约束 + 业务清洗)
-         │
-         ├──> [清洗审计报告 (Audit Log)]
-         └──> [标准 QA 数据集 (clean_qa.jsonl)]
-                     │
-                     ▼
-         [AsyncLLMEvalPipeline / RAGTriadPipeline] ─── (AsyncOpenAI + 并发信号量 + tenacity 重试)
-                     │
-                     ├──> 维度 1: 检索相关度 (Context Relevance, 1-5)
-                     ├──> 维度 2: 回答忠实度 (Faithfulness, 1-5) ──> [原子级幻觉定位]
-                     └──> 维度 3: 回答相关度 (Answer Relevance, 1-5)
-                     │
-                     ▼
-         [Streamlit 交互审计看板 (app.py) & 评测结果明细 (JSONL)]
-```
+- **数据契约与声明式清洗 (Data Engineering)**:
+  - 基于 **Pydantic V2 (Rust-core)** 实现底层高性能流式验证，自动过滤缺失字段与格式残损数据。
+  - 自动隔离脏数据并生成标准化清洗审计日志（清洗拦截率、格式异常统计）。
+- **RAG 三元组评估与细粒度幻觉定位 (RAG Triad & Hallucination Audit)**:
+  - 实现 **Context Relevance（检索相关度）**、**Faithfulness（事实忠实度）** 与 **Answer Relevance（回答相关度）** 三维量化。
+  - 落地**原子断言拆解（Atomic Claims Decomposition）**技术，将长回答解构为独立命题逐一做蕴含验证（Entailment Check），精准定位幻觉句子并输出裁判推理链（Rationale）。
+- **Agent 工具调用决策与参数审计 (Agent Tool-Use Evaluation)**:
+  - 采用确定性断言（Deterministic Assertion）评测 Agent 的 Function Calling 行为。
+  - 细粒度计算**参数精确率（Precision）**与**召回率（Recall）**。
+  - 设立闲聊负样本测试集，专门审计模型对非工具意图的**防误触发率（Over-triggering Check）**与拒识能力。
+- **高并发与网络韧性调度 (High-Concurrency Engine)**:
+  - 基于 `asyncio.Semaphore` 实施信号量限流削峰，保护下游 API 不被击穿。
+  - 结合 `tenacity` 配置**带随机抖动的指数退避（Exponential Backoff with Jitter）**，应对 HTTP 429 限流与偶发网络抖动。
+- **交互式 Web 看板与工程交付 (Dashboard & CI/CD)**:
+  - 基于 **Streamlit** 构建多维度评测看板，支持合格率分布、三元组均值雷达图与原子级事实高亮下钻。
+  - 配置 **pytest** 单元测试套件与 **GitHub Actions** CI 持续集成流水线，保障多环境自动化交付。
 
 ---
 
-## 核心技术特性
-
-1. **声明式数据清洗 (Declarative Sanitization)**：
-   - 基于 **Pydantic V2** 构建标准数据模型约束。
-   - 提供流式容错解析，自动隔离 `JSONDecodeError`、非法字段类型与空白异常数据。
-   - 端到端审计追踪，量化计算清洗合格率（Pass Rate）。
-2. **高并发异步评测引擎 (Async Evaluation Engine)**：
-   - 基于 `asyncio` 与 `AsyncOpenAI` 搭建非阻塞评测执行流水线。
-   - 使用 `asyncio.Semaphore` 实施精细化并发控制，杜绝瞬时流量触发 API 限流（429）。
-   - 接入 `tenacity` 库实现带随机抖动的指数退避重试（Exponential Backoff with Jitter）。
-3. **RAG 三元组与细粒度幻觉排查 (RAG Triad & Hallucination)**：
-   - **Context Relevance**：评估检索召回切片的支撑有效性与噪声比例。
-   - **Faithfulness / Groundedness**：基于原子断言（Atomic Claims）拆解，检测大模型先验知识污染，并定位幻觉句子。
-   - **Answer Relevance**：评估模型回答与用户真实意图的契合程度。
-4. **Streamlit 交互式审计看板**：
-   - 提供开箱即用的 Web 评测工作台，集成综合合格率、维度均值分布及 KPI 指标卡。
-   - 支持样本下钻筛选，高亮展示被系统捕获的幻觉断言及裁判推理（Rationale）。
-
----
-
-## 项目目录结构
+## 📁 项目结构
 
 ```text
 llm-eval-pipeline/
-├── assets/
-│   └── dashboard_preview.png # 看板效果预览截图
+├── .github/workflows/ci.yml   # GitHub Actions CI 自动化构建配置
+├── assets/                    # 看板指标与幻觉分析截图
 ├── data/
-│   ├── raw/                 # 原始脏数据与 RAG 评测输入
-│   └── processed/           # 清洗入库及评测打分结果
+│   ├── raw/                   # 原始脏数据与 Benchmark 测试集
+│   └── processed/             # 清洗与评测审计输出 (JSONL)
+├── scripts/
+│   └── generate_benchmark.py  # 评测基准数据集生成脚本
 ├── src/
-│   ├── __init__.py          # 模块标识
-│   ├── app.py               # Streamlit 可视化审计看板
-│   ├── clean_pipeline.py    # 数据清洗与校验流水线
-│   ├── eval_pipeline.py     # 异步并发评测流水线
-│   ├── rag_eval_pipeline.py # RAG 三元组与幻觉评测流水线
-│   └── test_adversarial.py  # 裁判区分度对抗压测脚本
-├── .env.example             # 环境变量配置模板
-├── .gitignore               # Git 忽略规则
-└── requirements.txt         # 核心依赖清单
+│   ├── clean_pipeline.py      # 数据清洗流水线 (Pydantic V2)
+│   ├── eval_pipeline.py       # 异步并发评测引擎与 Agent 审计
+│   ├── rag_eval_pipeline.py   # RAG 三元组与原子断言幻觉评估器
+│   └── app.py                 # Streamlit 交互式评测看板
+├── tests/
+│   ├── test_clean_pipeline.py # 清洗边界与容错测试
+│   └── test_agent_eval.py     # Agent 工具调用审计测试
+├── requirements.txt           # 核心依赖清单
+└── README.md                  # 工程架构与使用说明
 ```
 
 ---
 
-## 快速上手
+## 🚀 快速启动
 
-### 1. 虚拟环境配置
+### 1. 环境准备
 ```bash
-git clone https://github.com/xuetongshuaige13-spec/llm-eval-pipeline.git
+git clone [https://github.com/xuetongshuaige13-spec/llm-eval-pipeline.git](https://github.com/xuetongshuaige13-spec/llm-eval-pipeline.git)
 cd llm-eval-pipeline
-python -m venv venv
-
-# Windows PowerShell 激活
-.\venv\Scripts\Activate.ps1
-
-# 安装依赖
 pip install -r requirements.txt
 ```
 
-### 2. 配置环境变量
-复制环境模板并填入兼容 OpenAI 接口的大模型 API 凭证：
+### 2. 运行自动化测试 (CI 验证)
 ```bash
-copy .env.example .env
-```
-修改 `.env` 核心配置：
-```ini
-OPENAI_API_KEY=your_actual_api_key
-OPENAI_BASE_URL=https://api.deepseek.com/v1
-MODEL_NAME=deepseek-chat
-MOCK_MODE=false
+python -m pytest tests/ -v
 ```
 
-### 3. 执行核心流水线
+### 3. 生成基准测试数据
 ```bash
-# 运行数据清洗管线
-python src/clean_pipeline.py
-
-# 运行异步自动化评测
-python src/eval_pipeline.py
-
-# 运行 RAG 三元组与幻觉评测
-python src/rag_eval_pipeline.py
-
-# 运行对抗样本区分度测试
-python src/test_adversarial.py
+python scripts/generate_benchmark.py
 ```
 
-### 4. 启动 Web 可视化交互看板
+### 4. 启动 Web 交互审计看板
 ```bash
-streamlit run src/app.py
+python -m streamlit run src/app.py
 ```
+启动后访问 `http://localhost:8501` 查看 22 条基准样本的多维统计分布与细粒度幻觉排查详情。
 
 ---
 
-## RAG 评测压测实测指标
+## 📊 评测基准设计 (Benchmark Coverage)
 
-| 样本类型 | 检索相关度 (Context) | 回答忠实度 (Faithfulness) | 回答相关度 (Answer) | 幻觉检测定位 | 综合判定 |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| 黄金基准样本 (`rag_001`) | 5.0 / 5 | 5.0 / 5 | 5.0 / 5 | 无幻觉 | **Pass** |
-| 检索噪声/上下文缺失 (`rag_002`) | 2.0 / 5 | 2.0 / 5 | 4.0 / 5 | 上下文未支撑断言 | **Failed** |
-| 事实严重冲突/强幻觉 (`rag_003`) | 4.0 / 5 | 1.0 / 5 | 3.0 / 5 | 精准提取虚构断言 | **Failed** |
+评测基准集涵盖真实企业落地场景中的 5 类典型分布：
+1. **黄金基准样本（Gold Cases）**：检索高命中、无事实幻觉且紧扣用户意图。
+2. **事实性幻觉（Hallucinations）**：模型依赖先验知识虚构事实（如费用、地点、软硬件门槛）。
+3. **检索噪声污染（Context Noise）**：检索召回无关文档，检验系统的忠实拒答能力。
+4. **意图偏离跑题（Answer Drift）**：回答未直接响应用户具体诉求。
+5. **Agent 误触发与参数漂移（Agent Tool Errors）**：涵盖工具选型失误、入参噪声及闲聊误调工具。
