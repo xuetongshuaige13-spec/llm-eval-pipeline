@@ -1,0 +1,6 @@
+{"id": "qa_001", "query": "香港科技大学大数据科技硕士申请要求是什么？", "response": "通常需要计算机、数学或工程背景，雅思总分不低于6.5分。", "source": "admissions_faq"}
+{"id": "qa_002", "query": "什么是大模型的幻觉（Hallucination）？", "response": "   ", "source": "llm_terms"}
+{"id": "qa_003", "query": null, "response": "这是缺失 query 的异常样本。", "source": "web_scrape"}
+{"id": "qa_004", "query": "如何实现 Agent 的 Tool Use？", "response": "大模型通过生成特定格式的结构化文本（如 JSON/Function Call）调用外部 API 拿到结果后整合回答。"}
+{"id": "qa_005", "query": "   ", "response": "问题全为空格", "source": "log"}
+{"id": "qa_006", "query": "RAG系统的全称是什么？", "response": 12345, "source": "test_err"}
