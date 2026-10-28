@@ -220,3 +220,109 @@ if __name__ == "__main__":
 
     # 启动异步事件循环
     asyncio.run(pipeline.run())
+    
+import json
+from typing import Dict, Any, Optional
+from pydantic import BaseModel, Field
+
+# ================================
+# 1. Agent 工具调用评测数据契约
+# ================================
+
+class ToolCallSpec(BaseModel):
+    name: str = Field(description="调用的工具函数名")
+    arguments: Dict[str, Any] = Field(default_factory=dict, description="工具参数字典")
+
+class AgentEvalSample(BaseModel):
+    id: str
+    user_query: str
+    expected_call: Optional[ToolCallSpec] = None  # None 代表此意图不应触发任何工具（闲聊或直接回答）
+    model_output_call: Optional[ToolCallSpec] = None
+
+class AgentToolEvalResult(BaseModel):
+    id: str
+    tool_selection_correct: bool = Field(description="工具选择是否完全一致")
+    argument_precision: float = Field(description="参数精确率: 实际生成的参数中有多少是预期正确的")
+    argument_recall: float = Field(description="参数召回率: 预期的关键参数有多少被成功生成")
+    passed: bool = Field(description="综合判定是否全绿通过")
+    rationale: str = Field(description="审计原因说明")
+
+
+# ================================
+# 2. 确定性评估引擎
+# ================================
+
+class AgentToolEvaluator:
+    """Agent 工具调用与参数决策评估器"""
+
+    @staticmethod
+    def evaluate_sample(sample: AgentEvalSample) -> AgentToolEvalResult:
+        exp = sample.expected_call
+        act = sample.model_output_call
+
+        # 场景 A: 负样本/拒识测试（预期不调用工具）
+        if exp is None:
+            if act is None:
+                return AgentToolEvalResult(
+                    id=sample.id,
+                    tool_selection_correct=True,
+                    argument_precision=1.0,
+                    argument_recall=1.0,
+                    passed=True,
+                    rationale="正确识别无需调用工具，直接回复"
+                )
+            else:
+                return AgentToolEvalResult(
+                    id=sample.id,
+                    tool_selection_correct=False,
+                    argument_precision=0.0,
+                    argument_recall=0.0,
+                    passed=False,
+                    rationale=f"发生误触发（Over-triggering）：错误调用了工具 '{act.name}'"
+                )
+
+        # 场景 B: 预期调用工具，但模型漏调（Under-triggering）
+        if act is None:
+            return AgentToolEvalResult(
+                id=sample.id,
+                tool_selection_correct=False,
+                argument_precision=0.0,
+                argument_recall=0.0,
+                passed=False,
+                rationale=f"遗漏工具调用：预期调用 '{exp.name}'，模型直接回答"
+            )
+
+        # 场景 C: 工具名称对比
+        tool_match = (exp.name == act.name)
+        if not tool_match:
+            return AgentToolEvalResult(
+                id=sample.id,
+                tool_selection_correct=False,
+                argument_precision=0.0,
+                argument_recall=0.0,
+                passed=False,
+                rationale=f"工具选型错误：预期 '{exp.name}'，实际调用 '{act.name}'"
+            )
+
+        # 场景 D: 参数逐字段比对（计算 Precision 和 Recall）
+        exp_args = exp.arguments
+        act_args = act.arguments
+
+        correct_args_count = 0
+        for k, v in act_args.items():
+            if k in exp_args and exp_args[k] == v:
+                correct_args_count += 1
+
+        precision = correct_args_count / len(act_args) if act_args else (1.0 if not exp_args else 0.0)
+        recall = correct_args_count / len(exp_args) if exp_args else 1.0
+
+        is_passed = (precision == 1.0 and recall == 1.0)
+
+        return AgentToolEvalResult(
+            id=sample.id,
+            tool_selection_correct=True,
+            argument_precision=round(precision, 2),
+            argument_recall=round(recall, 2),
+            passed=is_passed,
+            rationale="参数完全匹配" if is_passed else f"参数不完全匹配: Precision={precision:.2f}, Recall={recall:.2f}"
+        )
